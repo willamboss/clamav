@@ -51,6 +51,8 @@
 
 #include "mpool.h"
 
+#include <pthread.h>
+
 // clang-format off
 
 #define AC_SPECIAL_ALT_CHAR             1
@@ -3972,6 +3974,125 @@ inline static int ac_special_altstr(const char *hexpr, uint8_t sigopts, struct c
 }
 
 /* FIXME: clean up the code */
+
+/*
+ * Rare AC anchors.
+ *
+ * Only AC_MAXDEPTH (3) bytes of each pattern go into the trie; by default the
+ * first static ones. When those bytes are common in real executables (the
+ * x86 prologue 55 8b ec, runs of 00 or ff, ...), the trie node is reached
+ * constantly and its candidates are verified over and over. At load time,
+ * move the anchor to the rarest window of 3 exact bytes in the pattern
+ * (frequencies from matcher-ac-trigrams.h), turning the bytes before it into
+ * a prefix that the existing backward matcher verifies. Match semantics are
+ * unchanged; only which bytes trigger verification changes.
+ */
+#include "matcher-ac-trigrams.h"
+
+/* Move the anchor only if the new window is at least 2^AC_RARE_MIN_GAIN times rarer. */
+#define AC_RARE_MIN_GAIN 2
+
+static uint8_t *ac_trigram_score; /* 2^24 entries, log2 bucket; 0 = rare */
+static pthread_once_t ac_trigram_once = PTHREAD_ONCE_INIT;
+
+static void ac_trigram_init(void)
+{
+    uint8_t *table = calloc((size_t)1 << 24, 1);
+    size_t i;
+
+    if (!table)
+        return; /* anchors simply stay where they are */
+    for (i = 0; i < sizeof(ac_trigram_freq) / sizeof(ac_trigram_freq[0]); i++)
+        table[ac_trigram_freq[i] >> 8] = (uint8_t)(ac_trigram_freq[i] & 0xff);
+    ac_trigram_score = table;
+}
+
+/* Score of the 3 elements at p, or -1 if they are not all exact bytes. */
+static inline int ac_window_score(const uint16_t *p)
+{
+    if ((p[0] & CLI_MATCH_METADATA) != CLI_MATCH_CHAR ||
+        (p[1] & CLI_MATCH_METADATA) != CLI_MATCH_CHAR ||
+        (p[2] & CLI_MATCH_METADATA) != CLI_MATCH_CHAR)
+        return -1;
+    return ac_trigram_score[((uint32_t)(p[0] & 0xff) << 16) | ((uint32_t)(p[1] & 0xff) << 8) | (p[2] & 0xff)];
+}
+
+/* Make full[0..ppos) the prefix and full[ppos..] the AC pattern (no prefix on entry). */
+static void ac_set_prefix(struct cli_ac_patt *patt, uint16_t ppos)
+{
+    uint16_t i, j;
+
+    patt->prefix           = patt->pattern;
+    patt->prefix_length[0] = ppos;
+    for (i = 0, j = 0; i < ppos; i++) {
+        if ((patt->prefix[i] & CLI_MATCH_WILDCARD) == CLI_MATCH_SPECIAL)
+            patt->special_pattern++;
+
+        if ((patt->prefix[i] & CLI_MATCH_METADATA) == CLI_MATCH_SPECIAL) {
+            patt->prefix_length[1] += patt->special_table[j]->len[0];
+            patt->prefix_length[2] += patt->special_table[j]->len[1];
+            j++;
+        } else {
+            patt->prefix_length[1]++;
+            patt->prefix_length[2]++;
+        }
+    }
+    patt->pattern = &patt->prefix[ppos];
+    patt->length[0] -= patt->prefix_length[0];
+    patt->length[1] -= patt->prefix_length[1];
+    patt->length[2] -= patt->prefix_length[2];
+}
+
+static void ac_select_rare_anchor(const struct cli_matcher *root, struct cli_ac_patt *patt, uint8_t sigopts)
+{
+    const uint16_t *full;
+    uint32_t total, cur, s, best;
+    int cur_score, best_score = INT_MAX;
+    unsigned int k;
+
+    if (root->ac_maxdepth != 3 || (sigopts & ACPATT_OPTION_NOCASE))
+        return;
+
+    pthread_once(&ac_trigram_once, ac_trigram_init);
+    if (!ac_trigram_score)
+        return;
+
+    full  = patt->prefix ? patt->prefix : patt->pattern;
+    cur   = patt->prefix ? patt->prefix_length[0] : 0;
+    total = cur + patt->length[0];
+    if (total < 3 || total > UINT16_MAX)
+        return;
+
+    cur_score = (cur + 3 <= total) ? ac_window_score(&full[cur]) : -1;
+    if (cur_score < 0)
+        return; /* unusual anchor; leave the established logic alone */
+
+    best = cur;
+    for (s = 0; s + 3 <= total; s++) {
+        int score = ac_window_score(&full[s]);
+
+        if (score >= 0 && score < best_score) {
+            best_score = score;
+            best       = s;
+        }
+    }
+    if (best == cur || best_score + AC_RARE_MIN_GAIN > cur_score)
+        return;
+
+    /* Undo any existing shift, then shift to the rare window. */
+    if (patt->prefix) {
+        for (k = 0; k < 3; k++) {
+            patt->length[k] += patt->prefix_length[k];
+            patt->prefix_length[k] = 0;
+        }
+        patt->pattern         = patt->prefix;
+        patt->prefix          = NULL;
+        patt->special_pattern = 0;
+    }
+    if (best)
+        ac_set_prefix(patt, (uint16_t)best);
+}
+
 cl_error_t cli_ac_addsig(struct cli_matcher *root, const char *virname, const char *hexsig, uint8_t sigopts, uint32_t sigid, uint16_t parts, uint16_t partno, uint16_t rtype, uint16_t type, uint32_t mindist, uint32_t maxdist, const char *offset, const uint32_t *lsigid, unsigned int options)
 {
     struct cli_ac_patt *new;
@@ -4436,6 +4557,8 @@ cl_error_t cli_ac_addsig(struct cli_matcher *root, const char *virname, const ch
         new->length[1] -= new->prefix_length[1];
         new->length[2] -= new->prefix_length[2];
     }
+
+    ac_select_rare_anchor(root, new, sigopts);
 
     if (new->length[2] + new->prefix_length[2] > root->maxpatlen) {
         // This is the longest pattern we've stored. Update our max-pattern-length record
