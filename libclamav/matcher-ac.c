@@ -2461,12 +2461,24 @@ cl_error_t cli_ac_scanbuff(
     cl_error_t ret;
     struct ac_index_iter iter;
 
-#define AC_NEXT_HEAD()                               \
-    do {                                             \
-        if (iter.idx)                                \
-            pattN = ac_index_iter_next(&iter);       \
-        else                                         \
-            pattN = pattN->next;                     \
+    /*
+     * Heads are sorted by partno, so a skipped head that would have made the
+     * plain walk jump to faillist is followed only by heads that would jump
+     * too. If none of those was visited, replay the jump when the index runs
+     * out, using the last (largest partno) head.
+     */
+#define AC_NEXT_HEAD()                                                       \
+    do {                                                                     \
+        if (iter.idx) {                                                      \
+            const struct cli_ac_list *last_ = iter.idx->last;                \
+            pattN = ac_index_iter_next(&iter);                               \
+            if (!iter.idx && last_->partno > mdata->min_partno) {            \
+                pattN    = faillist;                                         \
+                faillist = NULL;                                             \
+            }                                                                \
+        } else {                                                             \
+            pattN = pattN->next;                                             \
+        }                                                                    \
     } while (0)
 
     iter.idx      = NULL;
@@ -2492,6 +2504,10 @@ cl_error_t cli_ac_scanbuff(
                 /* Only visit heads that can accept the bytes following the AC window. */
                 ac_index_iter_init(&iter, current->index, buffer + i + 1, length - i - 1);
                 pattN = ac_index_iter_next(&iter);
+                if (!iter.idx && current->index->last->partno > mdata->min_partno) {
+                    pattN    = faillist;
+                    faillist = NULL;
+                }
             } else {
                 iter.idx = NULL;
                 pattN    = current->list;
