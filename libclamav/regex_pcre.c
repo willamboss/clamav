@@ -28,6 +28,8 @@
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
 
+#include <stdlib.h>
+
 #include "clamav.h"
 #include "others.h"
 #include "regex_pcre.h"
@@ -140,6 +142,18 @@ cl_error_t cli_pcre_compile(struct cli_pcre_data *pd, long long unsigned match_l
     pcre2_set_match_limit(pd->mctx, match_limit);
     pcre2_set_recursion_limit(pd->mctx, match_limit_recursion);
 
+    /*
+     * JIT-compile when available. Failure (no JIT support, out of memory,
+     * unsupported pattern) just leaves the interpreter in charge.
+     */
+    pd->jit = 0;
+    if (!getenv("CLAMAV_PCRE_NO_JIT") && 0 == pcre2_jit_compile(pd->re, PCRE2_JIT_COMPLETE)) {
+        size_t jitsize = 0;
+
+        if (0 == pcre2_pattern_info(pd->re, PCRE2_INFO_JITSIZE, &jitsize) && jitsize > 0)
+            pd->jit = 1;
+    }
+
     /* non-dynamic allocated fields set by caller */
     pcre2_compile_context_free(cctx);
     pcre2_general_context_free(gctx);
@@ -160,6 +174,16 @@ int cli_pcre_match(struct cli_pcre_data *pd, const unsigned char *buffer, size_t
 
     /* execute the pcre and return */
     rc = pcre2_match(pd->re, buffer, buflen, startoffset, options, results->match_data, pd->mctx);
+
+    /*
+     * The JIT counts match/recursion limits differently from the interpreter,
+     * so it is only trusted to say "no match": then the interpreter would also
+     * find no match or stop at a limit, and both are handled as no match
+     * below. Any other outcome (match, limit, error) is recomputed by the
+     * interpreter, keeping results identical to a build without JIT.
+     */
+    if (pd->jit && rc != PCRE2_ERROR_NOMATCH)
+        rc = pcre2_match(pd->re, buffer, buflen, startoffset, options | PCRE2_NO_JIT, results->match_data, pd->mctx);
     if (rc < 0 && rc != PCRE2_ERROR_NOMATCH) {
         switch (rc) {
             case PCRE2_ERROR_CALLOUT:

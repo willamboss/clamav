@@ -45,6 +45,7 @@ struct cli_pcre_data {
     int options;               /* pcre options */
     char *expression;          /* copied regular expression */
     uint32_t search_offset;    /* start offset to search at for pcre_exec */
+    int jit;                   /* JIT-compiled: used only as an exact "no match" filter, see cli_pcre_match() */
 };
 
 struct cli_pcre_results {
