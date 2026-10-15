@@ -104,6 +104,15 @@ struct cli_ac_patt {
     uint32_t boundary;
     uint8_t depth;
     uint8_t sigopts;
+    /*
+     * Quick-reject guard: one fixed-position byte the input must have for
+     * this pattern to match, checked before full verification. The byte at
+     * (AC window start + guard_off) must satisfy (b & guard_mask) == guard_byte.
+     * guard_mask == 0 means no guard.
+     */
+    uint8_t guard_byte;
+    uint8_t guard_mask;
+    int16_t guard_off;
 };
 
 struct cli_ac_list {
@@ -113,11 +122,55 @@ struct cli_ac_list {
         struct cli_ac_list *next;
     };
     struct cli_ac_list *next_same;
+    /*
+     * Copies of me->partno and me->guard_* (guard offset made relative to the
+     * end of the AC window) so the matcher can reject most candidates without
+     * touching the pattern struct. Filled in when the trie is built.
+     */
+    uint16_t partno;
+    uint8_t guard_byte;
+    uint8_t guard_mask;
+    int32_t guard_rel;
+};
+
+/*
+ * Optional per-node index for trie nodes that own many pattern heads.
+ *
+ * The AC trie is at most ac_maxdepth (3) bytes deep, so very common byte
+ * sequences (e.g. the x86 prologue 55 8b ec) can own tens of thousands of
+ * pattern heads, and every time the node is reached each of them would be
+ * verified. The index is a small trie over the exact bytes that must follow
+ * the AC window: level j groups heads by pattern[depth + j]. Heads whose
+ * element at that position is not a single exact (or no-case) byte go into
+ * the level's generic group. Large buckets get a child level, up to
+ * AC_INDEX_MAX_LEVELS bytes past the window.
+ *
+ * At scan time the matcher follows the input bytes down the levels and
+ * visits each level's generic group plus the final bucket, merged by
+ * original list position so match semantics (reporting order, partno
+ * handling) are unchanged. Skipped heads all require a byte the input does
+ * not have, so they could never have matched.
+ */
+#define AC_INDEX_MAX_LEVELS 4
+
+struct cli_ac_index_level {
+    uint32_t *generic; /* head positions (ascending) not keyed at this level */
+    uint32_t ngeneric;
+    uint32_t *bucket_start;             /* 257 offsets into bucket_heads */
+    uint32_t *bucket_heads;             /* head positions, ascending within each bucket */
+    struct cli_ac_index_level **child; /* 256 entries, or NULL; a child replaces its bucket */
+};
+
+struct cli_ac_node_index {
+    struct cli_ac_list **heads; /* the node's own heads, in list order */
+    struct cli_ac_list *last;   /* last own head; its ->next continues into the fail list */
+    struct cli_ac_index_level *top;
 };
 
 struct cli_ac_node {
     struct cli_ac_list *list;
     struct cli_ac_node **trans, *fail;
+    struct cli_ac_node_index *index; /* NULL unless the node owns many heads */
 };
 
 #define IS_LEAF(node) (!node->trans)
