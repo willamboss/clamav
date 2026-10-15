@@ -104,6 +104,23 @@ struct cli_ac_patt {
     uint32_t boundary;
     uint8_t depth;
     uint8_t sigopts;
+    /*
+     * Quick-reject guard: one fixed-position byte the input must have for
+     * this pattern to match, checked before full verification. The byte at
+     * (AC window start + guard_off) must satisfy (b & guard_mask) == guard_byte.
+     * guard_mask == 0 means no guard.
+     */
+    uint8_t guard_byte;
+    uint8_t guard_mask;
+    int16_t guard_off;
+    /*
+     * Runs of exact bytes adjacent to the AC window, compared with memcmp()
+     * before element-by-element verification: fwd_run bytes right after the
+     * window, then bwd_run bytes ending right before it (the prefix tail).
+     */
+    uint8_t fwd_run;
+    uint8_t bwd_run;
+    unsigned char *run_bytes;
 };
 
 struct cli_ac_list {
@@ -113,11 +130,66 @@ struct cli_ac_list {
         struct cli_ac_list *next;
     };
     struct cli_ac_list *next_same;
+    /*
+     * Copies of me->partno and me->guard_* (guard offset made relative to the
+     * end of the AC window) so the matcher can reject most candidates without
+     * touching the pattern struct. Filled in when the trie is built.
+     */
+    uint16_t partno;
+    uint8_t guard_byte;
+    uint8_t guard_mask;
+    int32_t guard_rel;
+    /*
+     * Set on a head when every pattern in its next_same chain is a later part
+     * (partno > 1) of a partial signature with a plain offset. Such a chain
+     * can only act if some member's previous part has already matched, so the
+     * matcher may skip verifying it when none has.
+     */
+    uint8_t later_parts_only;
+};
+
+/*
+ * Optional per-node index for trie nodes that own many pattern heads.
+ *
+ * The AC trie is at most ac_maxdepth (3) bytes deep, so very common byte
+ * sequences (e.g. the x86 prologue 55 8b ec) can own tens of thousands of
+ * pattern heads, and every time the node is reached each of them would be
+ * verified. The index is a small trie over the exact bytes that must follow
+ * the AC window. Each level groups heads by the input byte at one position
+ * (key_off) relative to the end of the window; the position is chosen per
+ * level, before or after the window, to minimise expected visits. Heads with
+ * no fixed single-byte constraint at that position go into the level's
+ * generic group. Large buckets get a child level keyed on another position,
+ * up to AC_INDEX_MAX_LEVELS levels.
+ *
+ * At scan time the matcher follows the input bytes down the levels and
+ * visits each level's generic group plus the final bucket, merged by
+ * original list position so match semantics (reporting order, partno
+ * handling) are unchanged. Skipped heads all require a byte the input does
+ * not have, so they could never have matched.
+ */
+#define AC_INDEX_MAX_LEVELS 4
+
+struct cli_ac_index_level {
+    int8_t key_off;    /* key byte position, relative to the end of the AC window */
+    uint32_t *generic; /* head positions (ascending) not keyed at this level */
+    uint32_t ngeneric;
+    uint32_t *bucket_start;             /* 257 offsets into bucket_heads */
+    uint32_t *bucket_heads;             /* head positions, ascending within each bucket */
+    struct cli_ac_index_level **child; /* 256 entries, or NULL; a child replaces its bucket */
+};
+
+struct cli_ac_node_index {
+    struct cli_ac_list **heads; /* the node's own heads, in list order */
+    struct cli_ac_list *last;   /* last own head; its ->next continues into the fail list */
+    struct cli_ac_index_level *top;
 };
 
 struct cli_ac_node {
     struct cli_ac_list *list;
     struct cli_ac_node **trans, *fail;
+    struct cli_ac_node_index *index; /* NULL unless indexing pays off for this node */
+    struct cli_ac_list *own_last;    /* last of the node's own heads; its ->next continues into the fail list */
 };
 
 #define IS_LEAF(node) (!node->trans)
@@ -163,6 +235,9 @@ cl_error_t cli_ac_initdata(struct cli_ac_data *data, uint32_t partsigs, uint32_t
  * @return cl_error_t
  */
 cl_error_t lsig_sub_matched(const struct cli_matcher *root, struct cli_ac_data *mdata, uint32_t lsig_id, uint32_t subsig_id, uint32_t realoff, int partial);
+
+/* Evaluate logical signature lsid's expression (compiled when possible). */
+int cli_ac_lsig_eval(const struct cli_matcher *root, uint32_t lsid, uint32_t *lsigcnt, unsigned int *cnt, uint64_t *ids);
 
 cl_error_t cli_ac_chkmacro(struct cli_matcher *root, struct cli_ac_data *data, unsigned lsigid1);
 int cli_ac_chklsig(const char *expr, const char *end, uint32_t *lsigcnt, unsigned int *cnt, uint64_t *ids, unsigned int parse_only);

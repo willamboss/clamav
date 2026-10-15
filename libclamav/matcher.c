@@ -837,14 +837,12 @@ static cl_error_t lsig_eval(cli_ctx *ctx, struct cli_matcher *root, struct cli_a
     uint64_t evalids            = 0;
     fmap_t *new_map             = NULL;
     struct cli_ac_lsig *ac_lsig = root->ac_lsigtable[lsid];
-    char *exp                   = ac_lsig->u.logic;
-    char *exp_end               = exp + strlen(exp);
 
     status = cli_ac_chkmacro(root, acdata, lsid);
     if (status != CL_SUCCESS)
         return status;
 
-    if (cli_ac_chklsig(exp, exp_end, acdata->lsigcnt[lsid], &evalcnt, &evalids, 0) != 1) {
+    if (cli_ac_lsig_eval(root, lsid, acdata->lsigcnt[lsid], &evalcnt, &evalids) != 1) {
         // Logical expression did not match.
         goto done;
     }

@@ -130,6 +130,8 @@ struct cli_ac_lsig {
 
 typedef void *fuzzyhashmap_t;
 
+struct cli_ac_lsig_ast;
+
 struct cli_matcher {
     unsigned int type;
 
@@ -147,6 +149,9 @@ struct cli_matcher {
     uint32_t ac_partsigs, ac_nodes, ac_lists, ac_patterns, ac_lsigs;
     struct cli_ac_lsig **ac_lsigtable;
     struct cli_ac_node *ac_root, **ac_nodetable;
+    uintptr_t *ac_direct24; /* optional 2^24 state table (see matcher-ac.c), NULL if unused */
+    struct cli_ac_lsig_ast **ac_lsig_ast; /* optional compiled logical expressions, indexed like ac_lsigtable */
+    uint32_t ac_lsig_ast_count;
     struct cli_ac_list **ac_listtable;
     struct cli_ac_patt **ac_pattable;
     struct cli_ac_patt **ac_reloff;

@@ -30,6 +30,11 @@
 #include <sys/stat.h>
 
 #include <assert.h>
+#ifdef HAVE_SYS_MMAN_H
+#include <sys/mman.h>
+#endif
+#include <limits.h>
+#include <stddef.h>
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif
@@ -248,7 +253,406 @@ static int sort_heads_by_partno_fn(const void *a, const void *b)
     return 0;
 }
 
-static inline void link_node_lists(struct cli_ac_list **listtable, unsigned int nentries)
+/* Nodes owning at least this many distinct pattern heads get an index. */
+#define AC_NODE_INDEX_MIN_HEADS 4
+/* A bucket with more heads than this is split again on another position. */
+#define AC_INDEX_SPLIT_HEADS 8
+
+/* Key positions considered, relative to the end of the AC window. */
+#define AC_KEY_OFF_MIN (-19)
+#define AC_KEY_OFF_MAX 20
+#define AC_KEY_SLOTS (AC_KEY_OFF_MAX - AC_KEY_OFF_MIN + 1)
+
+static unsigned int ac_special_fixed_width(const struct cli_ac_special *special);
+
+/* What a pattern requires of the input byte at one fixed position. */
+struct ac_key {
+    uint8_t kind; /* AC_KEY_* */
+    uint8_t value;
+    uint16_t index; /* byte index within a fixed-length string alternate */
+    const struct cli_ac_special *special;
+};
+
+enum {
+    AC_KEY_NONE = 0,
+    AC_KEY_CHAR,
+    AC_KEY_NOCASE,
+    AC_KEY_NIBBLE_HIGH,
+    AC_KEY_NIBBLE_LOW,
+    AC_KEY_ALT_CHAR,
+    AC_KEY_ALT_STR,
+};
+
+/* Rough relative frequency of byte values in scanned data. */
+static unsigned int ac_byte_weight(unsigned int b)
+{
+    return b == 0x00 ? 16 : b == 0xff ? 8 : b == 0x20 ? 2 : 1;
+}
+#define AC_BYTE_WEIGHT_TOTAL (253 + 16 + 8 + 2)
+
+static void ac_free_index_level(struct cli_matcher *root, struct cli_ac_index_level *level)
+{
+    unsigned int b;
+
+    if (!level)
+        return;
+
+    if (level->child) {
+        for (b = 0; b < 256; b++)
+            ac_free_index_level(root, level->child[b]);
+        MPOOL_FREE(root->mempool, level->child);
+    }
+    MPOOL_FREE(root->mempool, level->generic);
+    MPOOL_FREE(root->mempool, level->bucket_start);
+    MPOOL_FREE(root->mempool, level->bucket_heads);
+    MPOOL_FREE(root->mempool, level);
+}
+
+static void ac_free_node_index(struct cli_matcher *root, struct cli_ac_node *node)
+{
+    struct cli_ac_node_index *index = node->index;
+
+    if (!index)
+        return;
+
+    ac_free_index_level(root, index->top);
+    MPOOL_FREE(root->mempool, index->heads);
+    MPOOL_FREE(root->mempool, index);
+    node->index = NULL;
+}
+
+/* Fill `set` with the input bytes that satisfy `key`. Returns false for AC_KEY_NONE. */
+static bool ac_key_set(const struct ac_key *key, bool set[256])
+{
+    unsigned int b, j;
+
+    switch (key->kind) {
+        case AC_KEY_CHAR:
+            memset(set, 0, 256 * sizeof(bool));
+            set[key->value] = true;
+            return true;
+        case AC_KEY_NOCASE:
+            /* AC_MATCH_CHAR accepts b when CLI_NOCASE(b) == value. */
+            for (b = 0; b < 256; b++)
+                set[b] = (key->value == (unsigned char)CLI_NOCASE(b));
+            return true;
+        case AC_KEY_NIBBLE_HIGH:
+            for (b = 0; b < 256; b++)
+                set[b] = ((b & 0xf0) == key->value);
+            return true;
+        case AC_KEY_NIBBLE_LOW:
+            for (b = 0; b < 256; b++)
+                set[b] = ((b & 0x0f) == key->value);
+            return true;
+        case AC_KEY_ALT_CHAR:
+            memset(set, 0, 256 * sizeof(bool));
+            for (j = 0; j < key->special->num; j++)
+                set[key->special->alt.byte[j]] = true;
+            return true;
+        case AC_KEY_ALT_STR:
+            memset(set, 0, 256 * sizeof(bool));
+            for (j = 0; j < key->special->num; j++)
+                set[key->special->alt.f_str[j][key->index]] = true;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void ac_key_from_element(struct ac_key *key, uint16_t value)
+{
+    switch (value & CLI_MATCH_METADATA) {
+        case CLI_MATCH_CHAR:
+            key->kind = AC_KEY_CHAR;
+            break;
+        case CLI_MATCH_NOCASE:
+            key->kind = AC_KEY_NOCASE;
+            break;
+        case CLI_MATCH_NIBBLE_HIGH:
+            key->kind = AC_KEY_NIBBLE_HIGH;
+            break;
+        case CLI_MATCH_NIBBLE_LOW:
+            key->kind = AC_KEY_NIBBLE_LOW;
+            break;
+        default:
+            key->kind = AC_KEY_NONE;
+            return;
+    }
+    key->value = (key->kind == AC_KEY_NIBBLE_HIGH) ? (value & 0xf0) : (key->kind == AC_KEY_NIBBLE_LOW) ? (value & 0x0f) : (value & 0xff);
+}
+
+static void ac_key_from_special(struct ac_key *key, const struct cli_ac_special *special, unsigned int index)
+{
+    key->kind = AC_KEY_NONE;
+    if (special->negative || !special->num)
+        return;
+    key->special = special;
+    key->index   = (uint16_t)index;
+    key->kind    = (special->type == AC_SPECIAL_ALT_CHAR) ? AC_KEY_ALT_CHAR : AC_KEY_ALT_STR;
+}
+
+/*
+ * Record, for each position in [AC_KEY_OFF_MIN, AC_KEY_OFF_MAX] relative to
+ * the end of the AC window, what the pattern requires there. Only positions
+ * reachable through fixed-width elements are recorded, so a key position
+ * outside the buffer means the pattern's minimum length cannot fit either.
+ */
+static void ac_collect_keys(const struct cli_ac_patt *p, struct ac_key keys[AC_KEY_SLOTS])
+{
+    unsigned int k, width, t;
+    uint16_t specialcnt;
+    int pos;
+
+    memset(keys, 0, AC_KEY_SLOTS * sizeof(*keys));
+
+    /* Forward from the window end. The window itself holds no specials. */
+    specialcnt = p->special_pattern;
+    pos        = 0;
+    for (k = p->depth; k < p->length[0] && pos <= AC_KEY_OFF_MAX; k++) {
+        uint16_t value = p->pattern[k];
+
+        if ((value & CLI_MATCH_METADATA) == CLI_MATCH_SPECIAL) {
+            const struct cli_ac_special *special;
+
+            if (specialcnt >= p->special)
+                break;
+            special = p->special_table[specialcnt++];
+            width   = ac_special_fixed_width(special);
+            if (!width)
+                break;
+            for (t = 0; t < width && pos + (int)t <= AC_KEY_OFF_MAX; t++)
+                ac_key_from_special(&keys[pos + (int)t - AC_KEY_OFF_MIN], special, t);
+            pos += (int)width;
+        } else {
+            ac_key_from_element(&keys[pos - AC_KEY_OFF_MIN], value);
+            pos++;
+        }
+    }
+
+    /* Backward through the prefix, which ends right before the window. */
+    if (p->prefix && p->prefix_length[0]) {
+        specialcnt = p->special_pattern;
+        pos        = -(int)p->depth; /* one past the last prefix byte */
+        for (k = p->prefix_length[0]; k-- > 0 && pos > AC_KEY_OFF_MIN;) {
+            uint16_t value = p->prefix[k];
+
+            if ((value & CLI_MATCH_METADATA) == CLI_MATCH_SPECIAL) {
+                const struct cli_ac_special *special;
+
+                if (specialcnt == 0)
+                    break;
+                special = p->special_table[--specialcnt];
+                width   = ac_special_fixed_width(special);
+                if (!width)
+                    break;
+                for (t = 0; t < width; t++) {
+                    int off = pos - (int)width + (int)t;
+                    if (off >= AC_KEY_OFF_MIN)
+                        ac_key_from_special(&keys[off - AC_KEY_OFF_MIN], special, t);
+                }
+                pos -= (int)width;
+            } else {
+                pos--;
+                ac_key_from_element(&keys[pos - AC_KEY_OFF_MIN], value);
+            }
+        }
+    }
+}
+
+/*
+ * Expected number of heads visited per lookup if `items` are keyed at `slot`:
+ * the generic ones always, each keyed one with the probability that the
+ * input byte is in its set. Scaled by AC_BYTE_WEIGHT_TOTAL.
+ */
+static uint64_t ac_slot_cost(const struct ac_key *keys, const uint32_t *items, uint32_t nitems, unsigned int slot)
+{
+    bool set[256];
+    uint64_t cost = 0;
+    uint32_t i;
+    unsigned int b;
+
+    for (i = 0; i < nitems; i++) {
+        const struct ac_key *key = &keys[(size_t)items[i] * AC_KEY_SLOTS + slot];
+
+        if (key->kind == AC_KEY_CHAR) {
+            cost += ac_byte_weight(key->value);
+        } else if (ac_key_set(key, set)) {
+            for (b = 0; b < 256; b++) {
+                if (set[b])
+                    cost += ac_byte_weight(b);
+            }
+        } else {
+            cost += AC_BYTE_WEIGHT_TOTAL;
+        }
+    }
+    return cost;
+}
+
+/*
+ * Build one index level over `items` (positions into `heads`, ascending),
+ * keyed at the unused position with the lowest expected visits. Returns NULL
+ * on allocation failure or when no position beats a plain scan by `need`.
+ */
+static struct cli_ac_index_level *ac_build_index_level(struct cli_matcher *root, struct cli_ac_list **heads,
+                                                       const struct ac_key *keys, const uint32_t *items, uint32_t nitems,
+                                                       unsigned int level, uint64_t used_slots, uint64_t need)
+{
+    struct cli_ac_index_level *lvl = NULL;
+    uint32_t *counts               = NULL;
+    bool set[256];
+    uint32_t i, total = 0;
+    unsigned int b, slot, best_slot = AC_KEY_SLOTS;
+    uint64_t best_cost = UINT64_MAX;
+
+    for (slot = 0; slot < AC_KEY_SLOTS; slot++) {
+        uint64_t cost;
+
+        if (used_slots & ((uint64_t)1 << slot))
+            continue;
+        cost = ac_slot_cost(keys, items, nitems, slot);
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_slot = slot;
+        }
+    }
+    if (best_slot == AC_KEY_SLOTS || best_cost >= need)
+        return NULL;
+
+    lvl = MPOOL_CALLOC(root->mempool, 1, sizeof(*lvl));
+    if (!lvl)
+        goto fail;
+    lvl->key_off = (int8_t)((int)best_slot + AC_KEY_OFF_MIN);
+
+    lvl->generic      = MPOOL_MALLOC(root->mempool, nitems * sizeof(*lvl->generic));
+    lvl->bucket_start = MPOOL_CALLOC(root->mempool, 257, sizeof(*lvl->bucket_start));
+    counts            = calloc(256, sizeof(*counts));
+    if (!lvl->generic || !lvl->bucket_start || !counts)
+        goto fail;
+
+    /* Pass 1: classify and size the buckets. */
+    for (i = 0; i < nitems; i++) {
+        if (ac_key_set(&keys[(size_t)items[i] * AC_KEY_SLOTS + best_slot], set)) {
+            for (b = 0; b < 256; b++) {
+                if (set[b]) {
+                    counts[b]++;
+                    total++;
+                }
+            }
+        } else {
+            lvl->generic[lvl->ngeneric++] = items[i];
+        }
+    }
+
+    for (b = 0; b < 256; b++)
+        lvl->bucket_start[b + 1] = lvl->bucket_start[b] + counts[b];
+
+    lvl->bucket_heads = MPOOL_MALLOC(root->mempool, (total ? total : 1) * sizeof(*lvl->bucket_heads));
+    if (!lvl->bucket_heads)
+        goto fail;
+
+    /* Pass 2: fill buckets; visiting items in order keeps each bucket ascending. */
+    memset(counts, 0, 256 * sizeof(*counts));
+    for (i = 0; i < nitems; i++) {
+        if (ac_key_set(&keys[(size_t)items[i] * AC_KEY_SLOTS + best_slot], set)) {
+            for (b = 0; b < 256; b++) {
+                if (set[b])
+                    lvl->bucket_heads[lvl->bucket_start[b] + counts[b]++] = items[i];
+            }
+        }
+    }
+
+    /* Split buckets that are still large on another position. */
+    if (level + 1 < AC_INDEX_MAX_LEVELS) {
+        for (b = 0; b < 256; b++) {
+            uint32_t n = lvl->bucket_start[b + 1] - lvl->bucket_start[b];
+            struct cli_ac_index_level *child;
+
+            if (n <= AC_INDEX_SPLIT_HEADS)
+                continue;
+
+            /* A child must at least halve the expected visits of the bucket. */
+            child = ac_build_index_level(root, heads, keys, &lvl->bucket_heads[lvl->bucket_start[b]], n, level + 1,
+                                         used_slots | ((uint64_t)1 << best_slot), (uint64_t)n * AC_BYTE_WEIGHT_TOTAL / 2);
+            if (!child)
+                continue; /* the plain bucket still works */
+
+            if (!lvl->child) {
+                lvl->child = MPOOL_CALLOC(root->mempool, 256, sizeof(*lvl->child));
+                if (!lvl->child) {
+                    ac_free_index_level(root, child);
+                    break;
+                }
+            }
+            lvl->child[b] = child;
+        }
+    }
+
+    free(counts);
+    return lvl;
+
+fail:
+    free(counts);
+    ac_free_index_level(root, lvl);
+    return NULL;
+}
+
+/*
+ * Build the index for a node from its own heads (already in final list
+ * order). Failure simply leaves the node unindexed, which is always correct.
+ */
+static void ac_build_node_index(struct cli_matcher *root, struct cli_ac_node *node, struct cli_ac_list **heads, unsigned int nheads)
+{
+    struct cli_ac_node_index *index = NULL;
+    struct ac_key *keys             = NULL;
+    uint32_t *items                 = NULL;
+    uint64_t window_slots           = 0;
+    uint32_t i;
+    int off;
+
+    if (nheads < AC_NODE_INDEX_MIN_HEADS)
+        return;
+
+    keys  = malloc((size_t)nheads * AC_KEY_SLOTS * sizeof(*keys));
+    items = malloc(nheads * sizeof(*items));
+    if (!keys || !items)
+        goto done;
+
+    for (i = 0; i < nheads; i++) {
+        ac_collect_keys(heads[i]->me, &keys[(size_t)i * AC_KEY_SLOTS]);
+        items[i] = i;
+    }
+
+    /* The window bytes are already known; never key on them. */
+    for (off = -(int)heads[0]->me->depth; off < 0; off++)
+        window_slots |= (uint64_t)1 << (off - AC_KEY_OFF_MIN);
+
+    index = MPOOL_CALLOC(root->mempool, 1, sizeof(*index));
+    if (!index)
+        goto done;
+    index->heads = MPOOL_MALLOC(root->mempool, nheads * sizeof(*index->heads));
+    if (!index->heads)
+        goto fail;
+    memcpy(index->heads, heads, nheads * sizeof(*heads));
+    index->last = heads[nheads - 1];
+
+    /* Worth indexing only if it at least halves the expected visits. */
+    index->top = ac_build_index_level(root, index->heads, keys, items, nheads, 0, window_slots,
+                                      (uint64_t)nheads * AC_BYTE_WEIGHT_TOTAL / 2);
+    if (!index->top)
+        goto fail;
+
+    node->index = index;
+    goto done;
+
+fail:
+    MPOOL_FREE(root->mempool, index->heads);
+    MPOOL_FREE(root->mempool, index);
+done:
+    free(keys);
+    free(items);
+}
+
+static inline void link_node_lists(struct cli_matcher *root, struct cli_ac_list **listtable, unsigned int nentries)
 {
     struct cli_ac_list *prev = listtable[0];
     struct cli_ac_node *node = prev->node;
@@ -280,6 +684,25 @@ static inline void link_node_lists(struct cli_ac_list **listtable, unsigned int 
     for (i = 1; i < nheads; i++)
         listtable[i - 1]->next = listtable[i];
     listtable[nheads - 1]->next = NULL;
+    node->own_last              = listtable[nheads - 1];
+
+    for (i = 0; i < nheads; i++) {
+        const struct cli_ac_list *member;
+        uint8_t later_only = 1;
+
+        for (member = listtable[i]; member; member = member->next_same) {
+            const struct cli_ac_patt *p = member->me;
+
+            if (!p->sigid || p->partno < 2 || p->partno > p->parts ||
+                p->offdata[0] == CLI_OFF_VERSION || p->offdata[0] == CLI_OFF_MACRO) {
+                later_only = 0;
+                break;
+            }
+        }
+        listtable[i]->later_parts_only = later_only;
+    }
+
+    ac_build_node_index(root, node, listtable, nheads);
 }
 
 static void link_lists(struct cli_matcher *root)
@@ -290,13 +713,24 @@ static void link_lists(struct cli_matcher *root)
     if (!root->ac_lists)
         return;
 
+    /* Cache the fields the matcher checks first in the list entries themselves. */
+    for (i = 0; i < root->ac_lists; i++) {
+        struct cli_ac_list *entry      = root->ac_listtable[i];
+        const struct cli_ac_patt *patt = entry->me;
+
+        entry->partno     = patt->partno;
+        entry->guard_byte = patt->guard_byte;
+        entry->guard_mask = patt->guard_mask;
+        entry->guard_rel  = (int32_t)patt->guard_off - (int32_t)patt->depth;
+    }
+
     /* Group the list by owning node, pattern equality and sort by partno */
     cli_qsort(root->ac_listtable, root->ac_lists, sizeof(root->ac_listtable[0]), sort_list_fn);
 
     curnode = root->ac_listtable[0]->node;
     for (i = 1, grouplen = 1; i <= root->ac_lists; i++, grouplen++) {
         if (i == root->ac_lists || root->ac_listtable[i]->node != curnode) {
-            link_node_lists(&root->ac_listtable[i - grouplen], grouplen);
+            link_node_lists(root, &root->ac_listtable[i - grouplen], grouplen);
             if (i < root->ac_lists) {
                 grouplen = 0;
                 curnode  = root->ac_listtable[i]->node;
@@ -450,6 +884,227 @@ static int cli_ac_addpatt_recursive(struct cli_matcher *root, struct cli_ac_patt
     return cli_ac_addpatt_recursive(root, pattern, next, i + 1, len);
 }
 
+/* How far from the AC window to look for a guard byte. */
+#define AC_GUARD_MAX_DISTANCE 64
+
+/* Rough relative frequency of a guard in typical input; lower is more selective. */
+static unsigned int ac_guard_weight(uint8_t byte, uint8_t mask)
+{
+    unsigned int bits = 0, weight;
+    uint8_t m;
+
+    for (m = mask; m; m &= (uint8_t)(m - 1))
+        bits++;
+    weight = 1u << (8 - bits); /* each unconstrained bit doubles the hit rate */
+
+    if ((0x00 & mask) == byte)
+        weight *= 16; /* zero runs are everywhere in executables and documents */
+    else if ((0xff & mask) == byte)
+        weight *= 8;
+    else if ((0x20 & mask) == byte)
+        weight *= 2;
+
+    return weight;
+}
+
+struct ac_guard_pick {
+    unsigned int weight;
+    unsigned int dist;
+};
+
+static void ac_guard_offer(struct cli_ac_patt *pattern, uint8_t byte, uint8_t mask, int off, struct ac_guard_pick *best)
+{
+    unsigned int weight, dist = (off < 0) ? (unsigned int)-off : (unsigned int)off;
+
+    if (!mask)
+        return;
+
+    byte &= mask;
+    weight = ac_guard_weight(byte, mask);
+    if (weight < best->weight || (weight == best->weight && dist < best->dist)) {
+        best->weight        = weight;
+        best->dist          = dist;
+        pattern->guard_byte = byte;
+        pattern->guard_mask = mask;
+        pattern->guard_off  = (int16_t)off;
+    }
+}
+
+/* Offer a plain (non-special) pattern element at offset `off` as a guard. */
+static void ac_guard_offer_element(struct cli_ac_patt *pattern, uint16_t value, int off, struct ac_guard_pick *best)
+{
+    switch (value & CLI_MATCH_METADATA) {
+        case CLI_MATCH_CHAR:
+            ac_guard_offer(pattern, value & 0xff, 0xff, off, best);
+            break;
+        case CLI_MATCH_NIBBLE_HIGH:
+            ac_guard_offer(pattern, value & 0xf0, 0xf0, off, best);
+            break;
+        case CLI_MATCH_NIBBLE_LOW:
+            ac_guard_offer(pattern, value & 0x0f, 0x0f, off, best);
+            break;
+        default:
+            break;
+    }
+}
+
+/*
+ * Offer a set of acceptable bytes as a guard. Only the bits shared by every
+ * member are constrained, so any byte in the set passes the check.
+ */
+static void ac_guard_offer_set(struct cli_ac_patt *pattern, const unsigned char *bytes, size_t stride, unsigned int num, int off, struct ac_guard_pick *best)
+{
+    unsigned int j;
+    uint8_t diff = 0;
+
+    if (!num)
+        return;
+    for (j = 1; j < num; j++)
+        diff |= (uint8_t)(bytes[j * stride] ^ bytes[0]);
+    ac_guard_offer(pattern, bytes[0], (uint8_t)~diff, off, best);
+}
+
+/*
+ * Width of a special element if it always consumes the same number of bytes,
+ * else 0. Only fixed alternates qualify: boundary / line / word markers have
+ * no fixed width.
+ */
+static unsigned int ac_special_fixed_width(const struct cli_ac_special *special)
+{
+    switch (special->type) {
+        case AC_SPECIAL_ALT_CHAR:
+            return 1;
+        case AC_SPECIAL_ALT_STR_FIXED:
+            return (special->len[0] == special->len[1]) ? special->len[0] : 0;
+        default:
+            return 0;
+    }
+}
+
+/* Offer the first byte of a fixed-width special element starting at `off`. */
+static void ac_guard_offer_special(struct cli_ac_patt *pattern, const struct cli_ac_special *special, int off, struct ac_guard_pick *best)
+{
+    unsigned char firsts[256];
+    unsigned int j, num;
+
+    if (special->negative || !special->num)
+        return;
+
+    if (special->type == AC_SPECIAL_ALT_CHAR) {
+        ac_guard_offer_set(pattern, special->alt.byte, 1, special->num, off, best);
+    } else if (special->type == AC_SPECIAL_ALT_STR_FIXED) {
+        num = special->num < 256 ? special->num : 256;
+        for (j = 0; j < num; j++)
+            firsts[j] = special->alt.f_str[j][0];
+        if (num == special->num)
+            ac_guard_offer_set(pattern, firsts, 1, num, off, best);
+    }
+}
+
+/*
+ * Pick a guard byte for the pattern: an element outside the AC window whose
+ * position relative to the window start is fixed, i.e. everything between it
+ * and the window has a fixed width (plain elements and fixed alternates). The
+ * element can be an exact byte, a nibble, or a fixed alternate, reduced to the
+ * bits all its alternatives share.
+ *
+ * If the guard position falls outside the scanned buffer, the pattern's
+ * minimum length cannot fit, so ac_findmatch() would fail its length checks
+ * anyway: the guard can never reject a real match.
+ */
+static void ac_select_guard(struct cli_ac_patt *pattern)
+{
+    struct ac_guard_pick best = {UINT_MAX, UINT_MAX};
+    unsigned int k, width;
+    uint16_t specialcnt;
+    int off;
+
+    pattern->guard_mask = 0;
+    pattern->guard_byte = 0;
+    pattern->guard_off  = 0;
+
+    /* Forward: elements after the AC window (the window itself holds no specials). */
+    specialcnt = pattern->special_pattern;
+    off        = pattern->depth;
+    for (k = pattern->depth; k < pattern->length[0] && off < (int)pattern->depth + AC_GUARD_MAX_DISTANCE; k++) {
+        uint16_t value = pattern->pattern[k];
+
+        if ((value & CLI_MATCH_METADATA) == CLI_MATCH_SPECIAL) {
+            const struct cli_ac_special *special;
+
+            if (specialcnt >= pattern->special)
+                break;
+            special = pattern->special_table[specialcnt++];
+            width   = ac_special_fixed_width(special);
+            if (!width)
+                break;
+            ac_guard_offer_special(pattern, special, off, &best);
+            off += (int)width;
+        } else {
+            ac_guard_offer_element(pattern, value, off, &best);
+            off++;
+        }
+    }
+
+    /* Backward: the prefix, matched right-to-left from just before the window. */
+    if (pattern->prefix && pattern->prefix_length[0]) {
+        specialcnt = pattern->special_pattern;
+        off        = 0;
+        for (k = pattern->prefix_length[0]; k-- > 0 && off > -AC_GUARD_MAX_DISTANCE;) {
+            uint16_t value = pattern->prefix[k];
+
+            if ((value & CLI_MATCH_METADATA) == CLI_MATCH_SPECIAL) {
+                const struct cli_ac_special *special;
+
+                if (specialcnt == 0)
+                    break;
+                special = pattern->special_table[--specialcnt];
+                width   = ac_special_fixed_width(special);
+                if (!width)
+                    break;
+                off -= (int)width;
+                ac_guard_offer_special(pattern, special, off, &best);
+            } else {
+                off--;
+                ac_guard_offer_element(pattern, value, off, &best);
+            }
+        }
+    }
+}
+
+
+/* Exact-byte runs on both sides of the AC window (see cli_ac_patt). */
+static void ac_select_runs(struct cli_ac_patt *pattern)
+{
+    unsigned int f = 0, b = 0, k;
+
+    pattern->fwd_run   = 0;
+    pattern->bwd_run   = 0;
+    pattern->run_bytes = NULL;
+
+    while (pattern->depth + f < pattern->length[0] && f < 255 &&
+           (pattern->pattern[pattern->depth + f] & CLI_MATCH_METADATA) == CLI_MATCH_CHAR)
+        f++;
+    if (pattern->prefix) {
+        while (b < pattern->prefix_length[0] && b < 255 &&
+               (pattern->prefix[pattern->prefix_length[0] - 1 - b] & CLI_MATCH_METADATA) == CLI_MATCH_CHAR)
+            b++;
+    }
+    if (!f && !b)
+        return;
+
+    pattern->run_bytes = malloc(f + b);
+    if (!pattern->run_bytes)
+        return; /* plain verification still works */
+
+    for (k = 0; k < f; k++)
+        pattern->run_bytes[k] = (unsigned char)pattern->pattern[pattern->depth + k];
+    for (k = 0; k < b; k++)
+        pattern->run_bytes[f + k] = (unsigned char)pattern->prefix[pattern->prefix_length[0] - b + k];
+    pattern->fwd_run = (uint8_t)f;
+    pattern->bwd_run = (uint8_t)b;
+}
+
 cl_error_t cli_ac_addpatt(struct cli_matcher *root, struct cli_ac_patt *pattern)
 {
     struct cli_ac_patt **newtable;
@@ -481,6 +1136,8 @@ cl_error_t cli_ac_addpatt(struct cli_matcher *root, struct cli_ac_patt *pattern)
     root->ac_pattable[root->ac_patterns - 1] = pattern;
 
     pattern->depth = len;
+    ac_select_guard(pattern);
+    ac_select_runs(pattern);
 
     return cli_ac_addpatt_recursive(root, pattern, root->ac_root, 0, len);
 }
@@ -624,8 +1281,464 @@ static int ac_maketrans(struct cli_matcher *root)
     return CL_SUCCESS;
 }
 
+
+/*
+ * Direct 3-byte state table ("direct24").
+ *
+ * With an AC trie at most 3 levels deep, the automaton state after reading
+ * at least 3 bytes is fully determined by the last 3 bytes. The table maps
+ * the 24-bit key of those bytes straight to the state node, turning the
+ * dependent per-byte pointer chase into one independent table lookup.
+ * Entries hold the node pointer with bit 0 set if the node is final.
+ *
+ * The property is verified exhaustively against the real transitions before
+ * the table is used; any mismatch leaves the original traversal in place.
+ * Only large tries get a table (each costs 128 MiB).
+ */
+#define AC_DIRECT24_ENTRIES ((size_t)1 << 24)
+#define AC_DIRECT24_MIN_NODES 20000
+#define AC_DIRECT24_PREFETCH 8
+
+static bool ac_trans_rows_equal(struct cli_ac_node **a, struct cli_ac_node **b)
+{
+    return a == b || 0 == memcmp(a, b, 256 * sizeof(*a));
+}
+
+static void ac_build_direct24(struct cli_matcher *root)
+{
+    uintptr_t *table = NULL;
+    unsigned int a, b, c;
+    size_t bc;
+
+    if (!root->ac_root || root->ac_maxdepth != 3 || root->ac_nodes < AC_DIRECT24_MIN_NODES)
+        return;
+
+    /* Random access over 128 MiB: ask for huge pages so lookups don't miss the TLB. */
+    if (posix_memalign((void **)&table, (size_t)2 << 20, AC_DIRECT24_ENTRIES * sizeof(*table)))
+        table = NULL;
+#ifdef MADV_HUGEPAGE
+    if (table)
+        (void)madvise(table, AC_DIRECT24_ENTRIES * sizeof(*table), MADV_HUGEPAGE);
+#endif
+    if (!table) {
+        cli_dbgmsg("ac_build_direct24: can't allocate table, using plain transitions\n");
+        return;
+    }
+
+    /* T[abc] = state reached from the root after bytes a, b, c. */
+    for (a = 0; a < 256; a++) {
+        struct cli_ac_node *n1 = root->ac_root->trans[a];
+
+        if (!n1 || !n1->trans)
+            goto fail;
+        for (b = 0; b < 256; b++) {
+            struct cli_ac_node *n2 = n1->trans[b];
+
+            if (!n2 || !n2->trans)
+                goto fail;
+            for (c = 0; c < 256; c++) {
+                struct cli_ac_node *n3 = n2->trans[c];
+
+                if (!n3 || !n3->trans || ((uintptr_t)n3 & 1))
+                    goto fail;
+                table[(a << 16) | (b << 8) | c] = (uintptr_t)n3 | (IS_FINAL(n3) ? 1 : 0);
+            }
+        }
+    }
+
+    /*
+     * Verify: for every (b, c), all states T[*bc] have identical transition
+     * rows, and that row sends d to T[bcd]. Then by induction the state after
+     * any input of length >= 3 is T[last 3 bytes].
+     */
+    for (bc = 0; bc < 65536; bc++) {
+        struct cli_ac_node *ref = (struct cli_ac_node *)(table[bc] & ~(uintptr_t)1);
+        unsigned int d;
+
+        for (d = 0; d < 256; d++) {
+            if ((uintptr_t)ref->trans[d] != (table[(bc << 8) | d] & ~(uintptr_t)1))
+                goto fail;
+        }
+        for (a = 1; a < 256; a++) {
+            struct cli_ac_node *other = (struct cli_ac_node *)(table[((size_t)a << 16) | bc] & ~(uintptr_t)1);
+
+            if (!ac_trans_rows_equal(ref->trans, other->trans))
+                goto fail;
+        }
+    }
+
+    root->ac_direct24 = table;
+    cli_dbgmsg("ac_build_direct24: enabled for matcher type %u (%u nodes)\n", root->type, root->ac_nodes);
+    return;
+
+fail:
+    cli_dbgmsg("ac_build_direct24: state property does not hold for matcher type %u, using plain transitions\n", root->type);
+    free(table);
+}
+
+
+/*
+ * Precompiled logical signature expressions.
+ *
+ * lsig_eval() reparses each logical expression string with cli_ac_chklsig()
+ * every time it is evaluated. Expressions are compiled once into a small tree
+ * that reproduces cli_ac_chklsig()'s parse and evaluation exactly; anything
+ * the compiler does not recognise as canonical stays on the original parser.
+ * (Compiler adapted from the direct24-lsigast experiment.)
+ */
+#define AC_LSIG_AST_MAX_LENGTH 4096u
+#define AC_LSIG_AST_MAX_NODES 256u
+#define AC_LSIG_AST_MAX_DEPTH 64u
+
+struct cli_ac_lsig_ast_node {
+    uint32_t value;
+    uint32_t distinct;
+    uint16_t left;
+    uint16_t right;
+    uint8_t kind; /* 0: leaf; 1: expression */
+    uint8_t op;
+    uint8_t modifier;
+    uint8_t reserved;
+};
+
+struct cli_ac_lsig_ast {
+    uint16_t count;
+    uint16_t root;
+    struct cli_ac_lsig_ast_node nodes[];
+};
+struct cli_ac_lsig_builder {
+    uint16_t count;
+    struct cli_ac_lsig_ast_node nodes[AC_LSIG_AST_MAX_NODES];
+};
+
+static int cli_ac_lsig_decimal(const char *begin, const char *end, uint32_t *value)
+{
+    uint32_t number = 0;
+    const char *p;
+    if (begin == end)
+        return 0;
+    for (p = begin; p < end; p++) {
+        uint32_t digit;
+        if (*p < '0' || *p > '9')
+            return 0;
+        digit = (uint32_t)(*p - '0');
+        if (number > (UINT32_MAX - digit) / 10)
+            return 0;
+        number = number * 10 + digit;
+    }
+    *value = number;
+    return 1;
+}
+
+/* Build the same parse tree chosen by cli_ac_chklsig: the first depth-zero
+ * operator splits a range; a fully parenthesized range uses the last
+ * depth-one operator. Noncanonical legacy text stays on the original parser. */
+static int cli_ac_lsig_compile_range(struct cli_ac_lsig_builder *builder,
+                                     const char *expr, const char *end,
+                                     unsigned depth, uint16_t *out)
+{
+    size_t len, i, pth = 0, opoff = 0, op1off = 0, blkend = 0;
+    char op = 0, op1 = 0, blkmod = 0;
+    uint32_t value = 0, distinct = 0;
+    uint16_t left, right;
+    const char *lstart, *lend, *rstart, *rend;
+    struct cli_ac_lsig_ast_node *node;
+
+    if (depth >= AC_LSIG_AST_MAX_DEPTH || end <= expr ||
+        (size_t)(end - expr) > AC_LSIG_AST_MAX_LENGTH)
+        return 0;
+    len = (size_t)(end - expr);
+    for (i = 0; i < len; i++) {
+        char c = expr[i];
+        if (c == '(') {
+            pth++;
+        } else if (c == ')') {
+            if (!pth)
+                return 0;
+            pth--;
+        } else if (c == '&' || c == '|') {
+            if (!pth) {
+                op = c;
+                opoff = i;
+            } else if (pth == 1) {
+                op1 = c;
+                op1off = i;
+            }
+        } else if ((c < '0' || c > '9') && c != '<' && c != '>' &&
+                   c != '=' && c != ',') {
+            return 0;
+        }
+        if (op)
+            break;
+        if (op1 && !pth && c == ')') {
+            blkend = i;
+            if (i + 1 < len && (expr[i + 1] == '>' || expr[i + 1] == '<' || expr[i + 1] == '=')) {
+                const char *first = expr + i + 2;
+                const char *comma = memchr(first, ',', (size_t)(end - first));
+                if (comma) {
+                    if (!cli_ac_lsig_decimal(first, comma, &value) ||
+                        !cli_ac_lsig_decimal(comma + 1, end, &distinct))
+                        return 0;
+                } else if (!cli_ac_lsig_decimal(first, end, &value)) {
+                    return 0;
+                }
+                blkmod = expr[i + 1];
+                i = len - 1;
+            }
+            if (i + 1 == len)
+                break;
+            blkmod = 0;
+        }
+    }
+    if (pth)
+        return 0;
+    if (!op && !op1) {
+        const char *p = expr;
+        const char *modpos = NULL;
+        uint32_t id;
+        if (*expr == '(') {
+            if (end[-1] != ')')
+                return 0;
+            return cli_ac_lsig_compile_range(builder, expr + 1, end - 1, depth + 1, out);
+        }
+        while (p < end && *p >= '0' && *p <= '9')
+            p++;
+        if (!cli_ac_lsig_decimal(expr, p, &id) || id >= 64)
+            return 0;
+        if (p != end) {
+            if (*p != '<' && *p != '>' && *p != '=')
+                return 0;
+            modpos = p++;
+            if (!cli_ac_lsig_decimal(p, end, &value))
+                return 0;
+        }
+        if (builder->count == AC_LSIG_AST_MAX_NODES)
+            return 0;
+        *out = builder->count++;
+        node = &builder->nodes[*out];
+        memset(node, 0, sizeof(*node));
+        node->value = id;
+        node->distinct = value;
+        node->modifier = modpos ? (uint8_t)*modpos : 0;
+        return 1;
+    }
+    if (!op) {
+        if (!op1 || !op1off || !blkend || expr[0] != '(')
+            return 0;
+        op = op1;
+        opoff = op1off;
+        lstart = expr + 1;
+        lend = expr + opoff;
+        rstart = expr + opoff + 1;
+        rend = expr + blkend;
+    } else {
+        lstart = expr;
+        lend = expr + opoff;
+        rstart = expr + opoff + 1;
+        rend = end;
+    }
+    if (!opoff || lstart >= lend || rstart >= rend)
+        return 0;
+    if (!cli_ac_lsig_compile_range(builder, lstart, lend, depth + 1, &left) ||
+        !cli_ac_lsig_compile_range(builder, rstart, rend, depth + 1, &right) ||
+        builder->count == AC_LSIG_AST_MAX_NODES)
+        return 0;
+    *out = builder->count++;
+    node = &builder->nodes[*out];
+    memset(node, 0, sizeof(*node));
+    node->kind = 1;
+    node->op = (uint8_t)op;
+    node->modifier = (uint8_t)blkmod;
+    node->left = left;
+    node->right = right;
+    node->value = value;
+    node->distinct = distinct;
+    return 1;
+}
+
+static struct cli_ac_lsig_ast *cli_ac_lsig_compile(const char *expr, size_t *bytes)
+{
+    struct cli_ac_lsig_builder builder = {0};
+    struct cli_ac_lsig_ast *ast;
+    uint16_t root_index;
+    size_t length, size;
+    if (!expr)
+        return NULL;
+    length = strlen(expr);
+    if (!length || length > AC_LSIG_AST_MAX_LENGTH ||
+        !cli_ac_lsig_compile_range(&builder, expr, expr + length, 0, &root_index))
+        return NULL;
+    size = sizeof(*ast) + (size_t)builder.count * sizeof(builder.nodes[0]);
+    ast = (struct cli_ac_lsig_ast *)malloc(size);
+    if (!ast)
+        return NULL;
+    ast->count = builder.count;
+    ast->root = root_index;
+    memcpy(ast->nodes, builder.nodes, (size_t)builder.count * sizeof(builder.nodes[0]));
+    *bytes = size;
+    return ast;
+}
+
+static int cli_ac_lsig_ast_eval(const struct cli_ac_lsig_ast *ast, uint16_t index,
+                                const uint32_t *lsigcnt, unsigned int *cnt, uint64_t *ids)
+{
+    const struct cli_ac_lsig_ast_node *node = &ast->nodes[index];
+    uint32_t value;
+    unsigned int lcnt = 0, rcnt = 0, total;
+    uint64_t lids = 0, rids = 0, tids;
+    int lval, rval, ret;
+    if (!node->kind) {
+        value = lsigcnt[node->value];
+        if (node->modifier) {
+            if ((node->modifier == '=' && value != node->distinct) ||
+                (node->modifier == '<' && value >= node->distinct) ||
+                (node->modifier == '>' && value <= node->distinct))
+                return 0;
+        } else if (!value) {
+            return 0;
+        }
+        *cnt += value;
+        *ids |= UINT64_C(1) << node->value;
+        return 1;
+    }
+    /* The original recursively evaluates both operands, even if the left
+     * operand already determines the Boolean result. */
+    lval = cli_ac_lsig_ast_eval(ast, node->left, lsigcnt, &lcnt, &lids);
+    rval = cli_ac_lsig_ast_eval(ast, node->right, lsigcnt, &rcnt, &rids);
+    ret = node->op == '&' ? (lval && rval) : (lval || rval);
+    if (!node->modifier) {
+        if (ret) {
+            *cnt += lcnt + rcnt;
+            *ids |= lids | rids;
+        }
+        return ret;
+    }
+    total = ret ? lcnt + rcnt : 0;
+    tids = ret ? lids | rids : 0;
+    if ((node->modifier == '=' && total != node->value) ||
+        (node->modifier == '<' && total >= node->value) ||
+        (node->modifier == '>' && total <= node->value))
+        return 0;
+    if (node->distinct) {
+        unsigned int distinct = 0;
+        while (tids) {
+            distinct += (unsigned int)(tids & UINT64_C(1));
+            tids >>= 1;
+        }
+        if (distinct < node->distinct)
+            return 0;
+    }
+    /* The legacy block modifier propagates count, but not ids. */
+    *cnt += total;
+    return 1;
+}
+
+
+static void ac_lsig_ast_free(struct cli_matcher *root)
+{
+    uint32_t i;
+
+    if (!root->ac_lsig_ast)
+        return;
+    for (i = 0; i < root->ac_lsig_ast_count; i++)
+        free(root->ac_lsig_ast[i]);
+    free(root->ac_lsig_ast);
+    root->ac_lsig_ast       = NULL;
+    root->ac_lsig_ast_count = 0;
+}
+
+/* Test hook: compare every compiled expression with cli_ac_chklsig() on random counts. */
+static void ac_lsig_ast_selftest(const struct cli_matcher *root)
+{
+    uint32_t i, mismatches = 0, checked = 0;
+    unsigned int seed = 12345;
+    int t;
+
+    for (i = 0; i < root->ac_lsig_ast_count; i++) {
+        const struct cli_ac_lsig_ast *ast = root->ac_lsig_ast[i];
+        const char *expr;
+
+        if (!ast)
+            continue;
+        expr = root->ac_lsigtable[i]->u.logic;
+        for (t = 0; t < 200; t++) {
+            uint32_t counts[64];
+            unsigned int c1 = 0, c2 = 0, k;
+            uint64_t i1 = 0, i2 = 0;
+            int r1, r2;
+
+            for (k = 0; k < 64; k++) {
+                seed = seed * 1103515245u + 12345u;
+                switch ((seed >> 16) % (t < 20 ? 2 : 6)) {
+                    case 0: counts[k] = 0; break;
+                    case 1: counts[k] = 1; break;
+                    case 2: counts[k] = 2; break;
+                    case 3: counts[k] = 3 + ((seed >> 8) % 3); break;
+                    default: counts[k] = (seed >> 4) % 40; break;
+                }
+            }
+            r1 = cli_ac_chklsig(expr, expr + strlen(expr), counts, &c1, &i1, 0);
+            r2 = cli_ac_lsig_ast_eval(ast, ast->root, counts, &c2, &i2);
+            checked++;
+            if (r1 != r2 || c1 != c2 || i1 != i2) {
+                if (mismatches < 20)
+                    fprintf(stderr, "AST_SELFTEST mismatch lsig=%u expr=%s orig=(%d,%u,%llx) ast=(%d,%u,%llx)\n",
+                            i, expr, r1, c1, (unsigned long long)i1, r2, c2, (unsigned long long)i2);
+                mismatches++;
+                break;
+            }
+        }
+    }
+    fprintf(stderr, "AST_SELFTEST root=%u compiled=%u evaluations=%u mismatching_exprs=%u\n",
+            root->type, root->ac_lsig_ast_count, checked, mismatches);
+}
+
+static void ac_lsig_ast_build(struct cli_matcher *root)
+{
+    uint32_t i, compiled = 0;
+    size_t bytes;
+
+    if (!root->ac_lsigs || root->ac_lsig_ast)
+        return;
+
+    root->ac_lsig_ast = calloc(root->ac_lsigs, sizeof(*root->ac_lsig_ast));
+    if (!root->ac_lsig_ast)
+        return; /* the original parser is always available */
+    root->ac_lsig_ast_count = root->ac_lsigs;
+
+    for (i = 0; i < root->ac_lsigs; i++) {
+        const struct cli_ac_lsig *lsig = root->ac_lsigtable[i];
+
+        if (!lsig || lsig->type != CLI_LSIG_NORMAL || !lsig->u.logic)
+            continue;
+        root->ac_lsig_ast[i] = cli_ac_lsig_compile(lsig->u.logic, &bytes);
+        if (root->ac_lsig_ast[i])
+            compiled++;
+    }
+    cli_dbgmsg("ac_lsig_ast_build: compiled %u of %u logical expressions for matcher type %u\n",
+               compiled, root->ac_lsigs, root->type);
+
+    if (getenv("CLAMAV_AST_SELFTEST"))
+        ac_lsig_ast_selftest(root);
+}
+
+int cli_ac_lsig_eval(const struct cli_matcher *root, uint32_t lsid, uint32_t *lsigcnt, unsigned int *cnt, uint64_t *ids)
+{
+    const char *expr;
+
+    if (root->ac_lsig_ast && lsid < root->ac_lsig_ast_count && root->ac_lsig_ast[lsid]) {
+        const struct cli_ac_lsig_ast *ast = root->ac_lsig_ast[lsid];
+        return cli_ac_lsig_ast_eval(ast, ast->root, lsigcnt, cnt, ids);
+    }
+
+    expr = root->ac_lsigtable[lsid]->u.logic;
+    return cli_ac_chklsig(expr, expr + strlen(expr), lsigcnt, cnt, ids, 0);
+}
+
 cl_error_t cli_ac_buildtrie(struct cli_matcher *root)
 {
+    int ret;
+
     if (!root)
         return CL_EMALFDB;
 
@@ -639,7 +1752,13 @@ cl_error_t cli_ac_buildtrie(struct cli_matcher *root)
 
     link_lists(root);
 
-    return ac_maketrans(root);
+    ret = ac_maketrans(root);
+    if (ret != CL_SUCCESS)
+        return ret;
+
+    ac_build_direct24(root);
+    ac_lsig_ast_build(root);
+    return CL_SUCCESS;
 }
 
 cl_error_t cli_ac_init(struct cli_matcher *root, uint8_t mindepth, uint8_t maxdepth, uint8_t dconf_prefiltering)
@@ -722,6 +1841,7 @@ void cli_ac_free(struct cli_matcher *root)
 
     for (i = 0; i < root->ac_patterns; i++) {
         patt = root->ac_pattable[i];
+        free(patt->run_bytes);
         MPOOL_FREE(root->mempool, patt->prefix ? patt->prefix : patt->pattern);
         if (!(patt->lsigid[0] == 1)) {
             /* Don't free the virname for patterns lsigs (normal or yara).
@@ -752,6 +1872,7 @@ void cli_ac_free(struct cli_matcher *root)
     }
 
     for (i = 0; i < root->ac_nodes; i++) {
+        ac_free_node_index(root, root->ac_nodetable[i]);
         MPOOL_FREE(root->mempool, root->ac_nodetable[i]);
     }
 
@@ -767,6 +1888,10 @@ void cli_ac_free(struct cli_matcher *root)
     if (root->filter) {
         MPOOL_FREE(root->mempool, root->filter);
     }
+
+    free(root->ac_direct24);
+    root->ac_direct24 = NULL;
+    ac_lsig_ast_free(root);
 
     free_trans_nodes(root);
 }
@@ -1225,8 +2350,30 @@ static int ac_backward_match_branch(const unsigned char *buffer, uint32_t bp, ui
     /* backwards (prefix) validation, determines start */
     if (pattern->prefix && pattern->prefix_length[0]) {
         match = 1;
+        i     = pp;
 
-        for (i = pp; 1; i--) {
+        /*
+         * Fast path for the exact run at the end of the prefix: one memcmp()
+         * instead of the per-element loop below, ending in the same state.
+         * If the run could reach buffer[0], where the loop stops early, use
+         * the loop.
+         */
+        if (pp + 1 == (uint32_t)pattern->prefix_length[0] && pattern->bwd_run && bp + 1 > (uint32_t)pattern->bwd_run) {
+            unsigned int n = pattern->bwd_run;
+
+            if (memcmp(&buffer[bp + 1 - n], pattern->run_bytes + pattern->fwd_run, n))
+                return 0;
+
+            /* Now at the last element the loop would have checked. */
+            i  = (uint16_t)(pp + 1 - n);
+            bp = bp + 1 - n;
+            if (i == 0 || bp == 0)
+                goto prefix_checked;
+            i--;
+            bp--;
+        }
+
+        for (; 1; i--) {
             AC_MATCH_CHAR(pattern->prefix[i], buffer[bp], 1);
             if (!match)
                 return 0;
@@ -1238,6 +2385,7 @@ static int ac_backward_match_branch(const unsigned char *buffer, uint32_t bp, ui
             bp--;
         }
 
+    prefix_checked:
         *start    = bp;
         filestart = fileoffset - offset + bp;
     } else {
@@ -1392,7 +2540,12 @@ inline static int ac_findmatch(const unsigned char *buffer, uint32_t offset, uin
     if ((offset + pattern->length[1] > length) || (pattern->prefix_length[1] > offset))
         return 0;
 
-    match = ac_forward_match_branch(buffer, offset + pattern->depth, offset, fileoffset, length, pattern, pattern->depth, specialcnt, start, end);
+    /* The exact run after the window fits in the buffer by the length check above. */
+    if (pattern->fwd_run && memcmp(&buffer[offset + pattern->depth], pattern->run_bytes, pattern->fwd_run))
+        return 0;
+
+    match = ac_forward_match_branch(buffer, offset + pattern->depth + pattern->fwd_run, offset, fileoffset, length,
+                                    pattern, pattern->depth + pattern->fwd_run, specialcnt, start, end);
     if (match)
         return 1;
     return 0;
@@ -1802,6 +2955,156 @@ cl_error_t cli_ac_chkmacro(struct cli_matcher *root, struct cli_ac_data *data, u
     return CL_SUCCESS;
 }
 
+/*
+ * Walk over the candidate heads at a final node, equivalent to the plain
+ * list walk of the original matcher but skipping heads an index proves
+ * cannot match.
+ *
+ * The plain walk visits the node's own heads, then (for leaf nodes, through
+ * the list concatenation done in ac_maketrans) the fail node's heads. A head
+ * with partno > min_partno makes it jump to the start of the fail node's
+ * list (once). Heads are sorted by partno, so a skipped head that would have
+ * jumped is followed only by heads that would jump too; if none of those is
+ * visited, the jump is replayed when the indexed walk runs out, using the
+ * last (largest partno) head.
+ */
+struct ac_walk {
+    const struct cli_ac_node *node;      /* the final node reached */
+    const struct cli_ac_node_index *idx; /* index being iterated, or NULL */
+    const struct cli_ac_list *faillist;  /* jump target, NULL once used */
+    unsigned int in_fail;                /* walking the fail node's heads */
+    const unsigned char *buffer;
+    uint32_t pos; /* buffer position right after the AC window */
+    uint32_t length;
+    const uint32_t *min_partno;
+    unsigned int nstreams;
+    const uint32_t *cur[AC_INDEX_MAX_LEVELS + 1];
+    const uint32_t *end[AC_INDEX_MAX_LEVELS + 1];
+};
+
+static inline void ac_walk_add(struct ac_walk *w, const uint32_t *start, const uint32_t *end)
+{
+    if (start < end) {
+        w->cur[w->nstreams] = start;
+        w->end[w->nstreams] = end;
+        w->nstreams++;
+    }
+}
+
+/* Set up the merge streams of `idx` for the current AC window. */
+static inline void ac_walk_index(struct ac_walk *w, const struct cli_ac_node_index *idx)
+{
+    const struct cli_ac_index_level *lvl = idx->top;
+
+    w->idx      = idx;
+    w->nstreams = 0;
+
+    while (1) {
+        int64_t at = (int64_t)w->pos + lvl->key_off;
+        unsigned char b;
+
+        ac_walk_add(w, lvl->generic, lvl->generic + lvl->ngeneric);
+
+        /* Keyed heads need this byte; outside the buffer they cannot match. */
+        if (at < 0 || at >= (int64_t)w->length)
+            break;
+
+        b = w->buffer[at];
+        if (lvl->child && lvl->child[b]) {
+            lvl = lvl->child[b];
+            continue;
+        }
+
+        ac_walk_add(w, lvl->bucket_heads + lvl->bucket_start[b], lvl->bucket_heads + lvl->bucket_start[b + 1]);
+        break;
+    }
+}
+
+static struct cli_ac_list *ac_walk_exhausted(struct ac_walk *w);
+
+/* Next head from the index merge, or what the plain walk does after the indexed heads. */
+static inline struct cli_ac_list *ac_walk_step(struct ac_walk *w)
+{
+    unsigned int s, best;
+
+    switch (w->nstreams) {
+        case 0:
+            return ac_walk_exhausted(w);
+        case 1:
+            s = *w->cur[0]++;
+            if (w->cur[0] == w->end[0])
+                w->nstreams = 0;
+            return w->idx->heads[s];
+        default:
+            best = 0;
+            for (s = 1; s < w->nstreams; s++) {
+                if (*w->cur[s] < *w->cur[best])
+                    best = s;
+            }
+            s = *w->cur[best]++;
+            if (w->cur[best] == w->end[best]) {
+                w->nstreams--;
+                w->cur[best] = w->cur[w->nstreams];
+                w->end[best] = w->end[w->nstreams];
+            }
+            return w->idx->heads[s];
+    }
+}
+
+/* Start walking `node`'s own heads (in_fail = 0) or the fail node's heads (in_fail = 1). */
+static inline struct cli_ac_list *ac_walk_start(struct ac_walk *w, const struct cli_ac_node *node, unsigned int in_fail)
+{
+    w->in_fail = in_fail;
+    if (node->index) {
+        ac_walk_index(w, node->index);
+        return ac_walk_step(w);
+    }
+    w->idx = NULL;
+    return node->list;
+}
+
+/* The plain walk's jump to the start of the fail node's list. */
+static inline struct cli_ac_list *ac_walk_jump(struct ac_walk *w)
+{
+    if (!w->faillist) {
+        w->idx = NULL;
+        return NULL;
+    }
+    w->faillist = NULL;
+    return ac_walk_start(w, w->node->fail, 1);
+}
+
+/* The index merge ran out: replay what the plain walk would do next. */
+static struct cli_ac_list *ac_walk_exhausted(struct ac_walk *w)
+{
+    const struct cli_ac_node_index *idx = w->idx;
+    struct cli_ac_list *next;
+
+    /* A skipped head would have jumped iff the last (largest partno) one would. */
+    w->idx = NULL;
+    if (idx->last->partno > *w->min_partno)
+        return ac_walk_jump(w);
+
+    next = idx->last->next;
+    if (!w->in_fail && next && next == w->node->fail->list)
+        return ac_walk_start(w, w->node->fail, 1);
+    return next;
+}
+
+/* Advance past the head `cur` that was just visited. */
+static inline struct cli_ac_list *ac_walk_next(struct ac_walk *w, struct cli_ac_list *cur)
+{
+    struct cli_ac_list *next;
+
+    if (w->idx)
+        return ac_walk_step(w);
+
+    next = cur->next;
+    if (!w->in_fail && cur == w->node->own_last && next && next == w->node->fail->list && w->node->fail->index)
+        return ac_walk_start(w, w->node->fail, 1);
+    return next;
+}
+
 cl_error_t cli_ac_scanbuff(
     const unsigned char *buffer,
     uint32_t length,
@@ -1827,6 +3130,11 @@ cl_error_t cli_ac_scanbuff(
     struct cli_ac_result *newres;
     cl_error_t rc;
     cl_error_t ret;
+    struct ac_walk walk;
+    const uintptr_t *direct24;
+    uint32_t key24 = 0;
+
+#define AC_NEXT_HEAD() (pattN = ac_walk_next(&walk, pattN))
 
     if (!root->ac_root)
         return CL_CLEAN;
@@ -1837,36 +3145,92 @@ cl_error_t cli_ac_scanbuff(
     }
 
     current = root->ac_root;
+    direct24 = root->ac_direct24;
 
     for (i = 0; i < length; i++) {
-        current = current->trans[buffer[i]];
+        key24 = ((key24 << 8) | buffer[i]) & 0xffffff;
+        if (direct24 && i >= 2) {
+            /* After 3 bytes the state depends only on the last 3 bytes. */
+            uintptr_t entry;
+
+            /* The key AC_DIRECT24_PREFETCH bytes ahead is known now; start loading it. */
+            if (i + AC_DIRECT24_PREFETCH < length)
+                __builtin_prefetch(&direct24[((uint32_t)buffer[i + AC_DIRECT24_PREFETCH - 2] << 16) |
+                                             ((uint32_t)buffer[i + AC_DIRECT24_PREFETCH - 1] << 8) |
+                                             buffer[i + AC_DIRECT24_PREFETCH]]);
+            entry = direct24[key24];
+
+            if (!(entry & 1))
+                continue;
+            current = (struct cli_ac_node *)(entry & ~(uintptr_t)1);
+        } else {
+            current = current->trans[buffer[i]];
+        }
 
         if (UNLIKELY(IS_FINAL(current))) {
-            struct cli_ac_list *faillist = current->fail->list;
-            pattN                        = current->list;
+            walk.node       = current;
+            walk.faillist   = current->fail->list;
+            walk.buffer     = buffer;
+            walk.pos        = i + 1;
+            walk.length     = length;
+            walk.min_partno = &mdata->min_partno;
+            pattN           = ac_walk_start(&walk, current, 0);
+
             while (pattN) {
-                patt = pattN->me;
-                if (patt->partno > mdata->min_partno) {
-                    pattN    = faillist;
-                    faillist = NULL;
+                if (pattN->partno > mdata->min_partno) {
+                    pattN = ac_walk_jump(&walk);
                     continue;
                 }
+
+                if (pattN->guard_mask) {
+                    /* Cheap single-byte reject before touching the pattern. */
+                    int64_t gpos = (int64_t)i + 1 + pattN->guard_rel;
+
+                    if (gpos < 0 || gpos >= (int64_t)length || (buffer[gpos] & pattN->guard_mask) != pattN->guard_byte) {
+                        AC_NEXT_HEAD();
+                        continue;
+                    }
+                }
+
+                if (pattN->later_parts_only && mdata->offmatrix) {
+                    /*
+                     * Later parts act only once their previous part has matched
+                     * (see the partial signature handling below). If no member
+                     * of this chain has a recorded previous part, verifying it
+                     * cannot change anything.
+                     */
+                    const struct cli_ac_list *member;
+
+                    for (member = pattN; member; member = member->next_same) {
+                        const struct cli_ac_patt *p = member->me;
+
+                        if (p->sigid > mdata->partsigs ||
+                            (mdata->offmatrix[p->sigid - 1] && mdata->offmatrix[p->sigid - 1][p->partno - 2][0]))
+                            break;
+                    }
+                    if (!member) {
+                        AC_NEXT_HEAD();
+                        continue;
+                    }
+                }
+
+                patt = pattN->me;
                 bp = i + 1 - patt->depth;
                 if (patt->offdata[0] != CLI_OFF_VERSION && patt->offdata[0] != CLI_OFF_MACRO && !pattN->next_same && (patt->offset_min != CLI_OFF_ANY) && (!patt->sigid || patt->partno == 1)) {
                     if (patt->offset_min == CLI_OFF_NONE) {
-                        pattN = pattN->next;
+                        AC_NEXT_HEAD();
                         continue;
                     }
                     exptoff[0] = offset + bp - patt->prefix_length[2]; /* lower offset end */
                     exptoff[1] = offset + bp - patt->prefix_length[1]; /* higher offset end */
                     if (patt->offdata[0] == CLI_OFF_ABSOLUTE) {
                         if (patt->offset_max < exptoff[0] || patt->offset_min > exptoff[1]) {
-                            pattN = pattN->next;
+                            AC_NEXT_HEAD();
                             continue;
                         }
                     } else {
                         if (mdata->offset[patt->offset_min] == CLI_OFF_NONE || mdata->offset[patt->offset_max] < exptoff[0] || mdata->offset[patt->offset_min] > exptoff[1]) {
-                            pattN = pattN->next;
+                            AC_NEXT_HEAD();
                             continue;
                         }
                     }
@@ -2121,7 +3485,7 @@ cl_error_t cli_ac_scanbuff(
                         ptN = ptN->next_same;
                     }
                 }
-                pattN = pattN->next;
+                AC_NEXT_HEAD();
             }
         }
     }
@@ -2130,6 +3494,7 @@ cl_error_t cli_ac_scanbuff(
         return CL_VIRUS;
 
     return (mode & AC_SCAN_FT) ? type : CL_CLEAN;
+#undef AC_NEXT_HEAD
 }
 
 static int qcompare_byte(const void *a, const void *b)
