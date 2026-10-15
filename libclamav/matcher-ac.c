@@ -801,7 +801,12 @@ static int cli_ac_addpatt_recursive(struct cli_matcher *root, struct cli_ac_patt
 /* Rough relative frequency of a guard in typical input; lower is more selective. */
 static unsigned int ac_guard_weight(uint8_t byte, uint8_t mask)
 {
-    unsigned int weight = (mask == 0xff) ? 1 : 16;
+    unsigned int bits = 0, weight;
+    uint8_t m;
+
+    for (m = mask; m; m &= (uint8_t)(m - 1))
+        bits++;
+    weight = 1u << (8 - bits); /* each unconstrained bit doubles the hit rate */
 
     if ((0x00 & mask) == byte)
         weight *= 16; /* zero runs are everywhere in executables and documents */
@@ -813,69 +818,167 @@ static unsigned int ac_guard_weight(uint8_t byte, uint8_t mask)
     return weight;
 }
 
-static void ac_guard_consider(struct cli_ac_patt *pattern, uint16_t value, int off, unsigned int *best_weight, unsigned int *best_dist)
+struct ac_guard_pick {
+    unsigned int weight;
+    unsigned int dist;
+};
+
+static void ac_guard_offer(struct cli_ac_patt *pattern, uint8_t byte, uint8_t mask, int off, struct ac_guard_pick *best)
 {
-    uint8_t byte, mask;
     unsigned int weight, dist = (off < 0) ? (unsigned int)-off : (unsigned int)off;
 
-    switch (value & CLI_MATCH_METADATA) {
-        case CLI_MATCH_CHAR:
-            mask = 0xff;
-            byte = value & 0xff;
-            break;
-        case CLI_MATCH_NIBBLE_HIGH:
-            mask = 0xf0;
-            byte = value & 0xf0;
-            break;
-        case CLI_MATCH_NIBBLE_LOW:
-            mask = 0x0f;
-            byte = value & 0x0f;
-            break;
-        default:
-            return;
-    }
+    if (!mask)
+        return;
 
+    byte &= mask;
     weight = ac_guard_weight(byte, mask);
-    if (weight < *best_weight || (weight == *best_weight && dist < *best_dist)) {
-        *best_weight         = weight;
-        *best_dist           = dist;
+    if (weight < best->weight || (weight == best->weight && dist < best->dist)) {
+        best->weight        = weight;
+        best->dist          = dist;
         pattern->guard_byte = byte;
         pattern->guard_mask = mask;
         pattern->guard_off  = (int16_t)off;
     }
 }
 
+/* Offer a plain (non-special) pattern element at offset `off` as a guard. */
+static void ac_guard_offer_element(struct cli_ac_patt *pattern, uint16_t value, int off, struct ac_guard_pick *best)
+{
+    switch (value & CLI_MATCH_METADATA) {
+        case CLI_MATCH_CHAR:
+            ac_guard_offer(pattern, value & 0xff, 0xff, off, best);
+            break;
+        case CLI_MATCH_NIBBLE_HIGH:
+            ac_guard_offer(pattern, value & 0xf0, 0xf0, off, best);
+            break;
+        case CLI_MATCH_NIBBLE_LOW:
+            ac_guard_offer(pattern, value & 0x0f, 0x0f, off, best);
+            break;
+        default:
+            break;
+    }
+}
+
 /*
- * Pick a guard byte for the pattern: an exact (or nibble) element outside the
- * AC window whose position relative to the window start is fixed, i.e. every
- * element between it and the window is a single byte (no specials). If such
- * an element falls outside the scanned buffer, ac_findmatch() would fail its
- * length checks anyway, so the guard can never reject a real match.
+ * Offer a set of acceptable bytes as a guard. Only the bits shared by every
+ * member are constrained, so any byte in the set passes the check.
+ */
+static void ac_guard_offer_set(struct cli_ac_patt *pattern, const unsigned char *bytes, size_t stride, unsigned int num, int off, struct ac_guard_pick *best)
+{
+    unsigned int j;
+    uint8_t diff = 0;
+
+    if (!num)
+        return;
+    for (j = 1; j < num; j++)
+        diff |= (uint8_t)(bytes[j * stride] ^ bytes[0]);
+    ac_guard_offer(pattern, bytes[0], (uint8_t)~diff, off, best);
+}
+
+/*
+ * Width of a special element if it always consumes the same number of bytes,
+ * else 0. Only fixed alternates qualify: boundary / line / word markers have
+ * no fixed width.
+ */
+static unsigned int ac_special_fixed_width(const struct cli_ac_special *special)
+{
+    switch (special->type) {
+        case AC_SPECIAL_ALT_CHAR:
+            return 1;
+        case AC_SPECIAL_ALT_STR_FIXED:
+            return (special->len[0] == special->len[1]) ? special->len[0] : 0;
+        default:
+            return 0;
+    }
+}
+
+/* Offer the first byte of a fixed-width special element starting at `off`. */
+static void ac_guard_offer_special(struct cli_ac_patt *pattern, const struct cli_ac_special *special, int off, struct ac_guard_pick *best)
+{
+    unsigned char firsts[256];
+    unsigned int j, num;
+
+    if (special->negative || !special->num)
+        return;
+
+    if (special->type == AC_SPECIAL_ALT_CHAR) {
+        ac_guard_offer_set(pattern, special->alt.byte, 1, special->num, off, best);
+    } else if (special->type == AC_SPECIAL_ALT_STR_FIXED) {
+        num = special->num < 256 ? special->num : 256;
+        for (j = 0; j < num; j++)
+            firsts[j] = special->alt.f_str[j][0];
+        if (num == special->num)
+            ac_guard_offer_set(pattern, firsts, 1, num, off, best);
+    }
+}
+
+/*
+ * Pick a guard byte for the pattern: an element outside the AC window whose
+ * position relative to the window start is fixed, i.e. everything between it
+ * and the window has a fixed width (plain elements and fixed alternates). The
+ * element can be an exact byte, a nibble, or a fixed alternate, reduced to the
+ * bits all its alternatives share.
+ *
+ * If the guard position falls outside the scanned buffer, the pattern's
+ * minimum length cannot fit, so ac_findmatch() would fail its length checks
+ * anyway: the guard can never reject a real match.
  */
 static void ac_select_guard(struct cli_ac_patt *pattern)
 {
-    unsigned int best_weight = UINT_MAX, best_dist = UINT_MAX;
-    unsigned int k;
+    struct ac_guard_pick best = {UINT_MAX, UINT_MAX};
+    unsigned int k, width;
+    uint16_t specialcnt;
+    int off;
 
     pattern->guard_mask = 0;
     pattern->guard_byte = 0;
     pattern->guard_off  = 0;
 
-    /* Forward: elements after the AC window. */
-    for (k = pattern->depth; k < pattern->length[0] && k < (unsigned int)pattern->depth + AC_GUARD_MAX_DISTANCE; k++) {
-        if ((pattern->pattern[k] & CLI_MATCH_METADATA) == CLI_MATCH_SPECIAL)
-            break;
-        ac_guard_consider(pattern, pattern->pattern[k], (int)k, &best_weight, &best_dist);
+    /* Forward: elements after the AC window (the window itself holds no specials). */
+    specialcnt = pattern->special_pattern;
+    off        = pattern->depth;
+    for (k = pattern->depth; k < pattern->length[0] && off < (int)pattern->depth + AC_GUARD_MAX_DISTANCE; k++) {
+        uint16_t value = pattern->pattern[k];
+
+        if ((value & CLI_MATCH_METADATA) == CLI_MATCH_SPECIAL) {
+            const struct cli_ac_special *special;
+
+            if (specialcnt >= pattern->special)
+                break;
+            special = pattern->special_table[specialcnt++];
+            width   = ac_special_fixed_width(special);
+            if (!width)
+                break;
+            ac_guard_offer_special(pattern, special, off, &best);
+            off += (int)width;
+        } else {
+            ac_guard_offer_element(pattern, value, off, &best);
+            off++;
+        }
     }
 
-    /* Backward: the prefix, which is matched right-to-left from just before the window. */
+    /* Backward: the prefix, matched right-to-left from just before the window. */
     if (pattern->prefix && pattern->prefix_length[0]) {
-        for (k = 1; k <= pattern->prefix_length[0] && k <= AC_GUARD_MAX_DISTANCE; k++) {
-            uint16_t value = pattern->prefix[pattern->prefix_length[0] - k];
+        specialcnt = pattern->special_pattern;
+        off        = 0;
+        for (k = pattern->prefix_length[0]; k-- > 0 && off > -AC_GUARD_MAX_DISTANCE;) {
+            uint16_t value = pattern->prefix[k];
 
-            if ((value & CLI_MATCH_METADATA) == CLI_MATCH_SPECIAL)
-                break;
-            ac_guard_consider(pattern, value, -(int)k, &best_weight, &best_dist);
+            if ((value & CLI_MATCH_METADATA) == CLI_MATCH_SPECIAL) {
+                const struct cli_ac_special *special;
+
+                if (specialcnt == 0)
+                    break;
+                special = pattern->special_table[--specialcnt];
+                width   = ac_special_fixed_width(special);
+                if (!width)
+                    break;
+                off -= (int)width;
+                ac_guard_offer_special(pattern, special, off, &best);
+            } else {
+                off--;
+                ac_guard_offer_element(pattern, value, off, &best);
+            }
         }
     }
 }
